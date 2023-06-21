@@ -78,7 +78,7 @@ fn get_fake_path(c_str: &CStr) -> Result<CString, Box<dyn Error>> {
     // trim off leading `/` since `.join` will replace if it finds an absolute path
     let fake_path = fake_root.join(&path_str[1..]);
     if !fake_path.exists() {
-        return Err("no file found in fake root".into());
+        return Err(format!("not in fake root: {}", path_str).into());
     }
 
     // we found a fake file, return a string representing its path
@@ -142,13 +142,36 @@ mod tests {
         fs::create_dir_all(&fake_etc).unwrap();
         fs::write(fake_etc.join("hosts"), "🎉").unwrap();
 
-        let output = Command::new("cat")
-            .arg("/etc/hosts")
-            .env("LD_PRELOAD", get_so().display().to_string())
-            .env("FAKE_ROOT", &tmp_dir)
-            .output()
-            .unwrap();
+        // check hook worked
+        {
+            let output = Command::new("cat")
+                .arg("/etc/hosts")
+                .env("LD_PRELOAD", get_so().display().to_string())
+                .env("FAKE_ROOT", &tmp_dir)
+                .output()
+                .unwrap();
 
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "🎉");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "🎉");
+        }
+
+        // check debug log worked
+        {
+            let output = Command::new("cat")
+                .arg("/etc/passwd")
+                .env("LD_PRELOAD", get_so().display().to_string())
+                .env("FAKE_ROOT", &tmp_dir)
+                .env("DEBUG", "1")
+                .output()
+                .unwrap();
+
+            // assert not hooked - should be the same bytes
+            assert_eq!(output.stdout, fs::read("/etc/passwd").unwrap());
+
+            // assert debug output
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                "@HOOK@: not in fake root: /etc/passwd"
+            );
+        }
     }
 }
