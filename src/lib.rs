@@ -1,13 +1,28 @@
 //! A simple crate which provides the ability to redirect filesystem calls.
 //! This crate builds a library that can be used via `LD_PRELOAD`.
 //!
-//! An example:
+//! Some examples follow.
+//!
+//! **Intercept a file:**
 //! ```bash
 //! mkdir /tmp/etc
 //! echo "tee hee" > /tmp/etc/hosts
 //! FAKE_ROOT="/tmp" LD_PRELOAD="path/to/libfakeroot.so" cat /etc/hosts
 //! # tee hee
 //! ```
+//!
+//! **Intercept a directory list:**
+//! ```bash
+//! mkdir /tmp/etc
+//! echo "whatever" > /tmp/etc/🪃
+//! FAKE_ROOT="/tmp" FAKE_DIRS=1 LD_PRELOAD="path/to/libfakeroot.so" ls /etc
+//! # 🪃
+//! ```
+//!
+//! Options are configured via environment variables:
+//! * `FAKE_ROOT`: absolute path to the fake root
+//! * `FAKE_DIRS`: whether or not to intercept directory listing calls too
+//! * `DEBUG`: if set, will debug log to STDERR
 
 use std::cell::OnceCell;
 use std::error::Error;
@@ -16,10 +31,13 @@ use std::os::unix::prelude::OsStrExt;
 use std::path::PathBuf;
 use std::{env, str};
 
+use libc::DIR;
 use libc::{c_char, c_int};
 
 /// Required: absolute path to the directory to use as the fake root
 pub const ENV_FAKE_ROOT: &str = "FAKE_ROOT";
+/// Optional: should this also hook directories?
+pub const ENV_FAKE_DIRS: &str = "FAKE_DIRS";
 /// Optional: should this hook log debug information to STDERR?
 pub const ENV_DEBUG: &str = "DEBUG";
 
@@ -116,6 +134,23 @@ redhook::hook! {
     }
 }
 
+redhook::hook! {
+    unsafe fn opendir(path: *const c_char) -> *mut DIR => my_opendir {
+        if env::var(ENV_FAKE_DIRS).is_err() {
+            return redhook::real!(opendir)(path);
+        }
+
+        let fake = get_fake_path(CStr::from_ptr(path));
+        match fake {
+            Ok(c_str) => redhook::real!(opendir)(c_str.as_ptr()),
+            Err(e) => {
+                log!("{}: {}", HOOK_TAG, e);
+                redhook::real!(opendir)(path)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -124,6 +159,10 @@ mod tests {
         process::{self, Command},
     };
 
+    use super::*;
+
+    // NOTE: this requires that `cargo build` be run before the tests are run
+    // - is there a way to use one that's built when the tests are built?
     fn get_so() -> PathBuf {
         env::current_exe() // target/debug/deps/<file>
             .unwrap()
@@ -134,44 +173,95 @@ mod tests {
             .join("libfakeroot.so")
     }
 
-    #[test]
-    fn it_works() {
-        // create fake root with fake /etc/hosts
-        let tmp_dir = env::temp_dir().join(format!("fakehook-{}", process::id()));
-        let fake_etc = tmp_dir.join("etc");
+    macro_rules! cmd {
+        (
+            $fake_root:expr,
+            $cmd:expr
+            $(, dirs = $dirs:literal)?
+            $(, debug = $debug:literal)?
+        ) => {{
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg($cmd)
+                .env("LD_PRELOAD", get_so().display().to_string())
+                .env(ENV_FAKE_ROOT, $fake_root);
+            $(
+                if $dirs {
+                    cmd.env(ENV_FAKE_DIRS, "1");
+                }
+            )?
+            $(
+                if $debug {
+                    cmd.env("DEBUG", "1");
+                }
+            )?
+            cmd.output()
+                .unwrap()
+        }};
+    }
+
+    macro_rules! test {
+        ($name:ident, $f:expr) => {
+            #[test]
+            fn $name() {
+                let tmp_dir = env::temp_dir().join(format!(
+                    "fakehook-{}-{}",
+                    stringify!($name),
+                    process::id()
+                ));
+                std::fs::create_dir_all(&tmp_dir).unwrap();
+                $f(&tmp_dir);
+                std::fs::remove_dir_all(&tmp_dir).unwrap();
+            }
+        };
+    }
+
+    test!(simple, |dir: &PathBuf| {
+        let fake_etc = dir.join("etc");
         fs::create_dir_all(&fake_etc).unwrap();
         fs::write(fake_etc.join("hosts"), "🎉").unwrap();
 
         // check hook worked
-        {
-            let output = Command::new("cat")
-                .arg("/etc/hosts")
-                .env("LD_PRELOAD", get_so().display().to_string())
-                .env("FAKE_ROOT", &tmp_dir)
-                .output()
-                .unwrap();
+        let output = cmd!(&dir, "cat /etc/hosts");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "🎉");
 
-            assert_eq!(String::from_utf8_lossy(&output.stdout), "🎉");
-        }
+        // check other files aren't hooked
+        let output = cmd!(&dir, "cat /etc/passwd", debug = true);
+        assert_eq!(output.stdout, fs::read("/etc/passwd").unwrap());
+    });
 
-        // check debug log worked
-        {
-            let output = Command::new("cat")
-                .arg("/etc/passwd")
-                .env("LD_PRELOAD", get_so().display().to_string())
-                .env("FAKE_ROOT", &tmp_dir)
-                .env("DEBUG", "1")
-                .output()
-                .unwrap();
+    test!(debug, |dir: &PathBuf| {
+        let fake_etc = dir.join("etc");
+        fs::create_dir_all(&fake_etc).unwrap();
+        fs::write(fake_etc.join("hosts"), "🎉").unwrap();
 
-            // assert not hooked - should be the same bytes
-            assert_eq!(output.stdout, fs::read("/etc/passwd").unwrap());
+        // this checks ENV_DEBUG behaviour, so ensure it's not set
+        assert!(
+            env::var(ENV_DEBUG).is_err(),
+            "DEBUG must not be defined during tests"
+        );
 
-            // assert debug output
-            assert_eq!(
-                String::from_utf8_lossy(&output.stderr).trim(),
-                "@HOOK@: not in fake root: /etc/passwd"
-            );
-        }
-    }
+        // should be no logs
+        let output = cmd!(&dir, "cat /etc/hosts");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+        // should be logs
+        let output = cmd!(&dir, "cat /etc/passwd", debug = true);
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("@HOOK@: not in fake root: /etc/passwd"));
+    });
+
+    test!(dir, |dir: &PathBuf| {
+        let fake_etc = dir.join("etc");
+        fs::create_dir_all(&fake_etc).unwrap();
+        fs::write(fake_etc.join("FAKED"), "💥").unwrap();
+
+        // check dir not hooked
+        let output = cmd!(&dir, "ls /etc");
+        assert_ne!(String::from_utf8_lossy(&output.stdout).trim(), "FAKED");
+
+        // check dir hooked
+        let output = cmd!(&dir, "ls /etc", dirs = true);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "FAKED");
+    });
 }
