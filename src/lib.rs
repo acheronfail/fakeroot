@@ -31,8 +31,8 @@ use std::os::unix::prelude::OsStrExt;
 use std::path::PathBuf;
 use std::{env, str};
 
-use libc::DIR;
 use libc::{c_char, c_int};
+use libc::{DIR, FILE};
 
 /// Required: absolute path to the directory to use as the fake root
 pub const ENV_FAKE_ROOT: &str = "FAKE_ROOT";
@@ -104,49 +104,50 @@ fn get_fake_path(c_str: &CStr) -> Result<CString, Box<dyn Error>> {
     Ok(CString::new(fake_path.as_os_str().as_bytes()).unwrap())
 }
 
+// macros ----------------------------------------------------------------------
+
+macro_rules! do_hook {
+    ($name:ident => $($before_arg:ident, )* [$path:ident] $(, $after_arg:ident)* $(,)?) => {{
+        let fake = get_fake_path(CStr::from_ptr($path));
+        match fake {
+            Ok(c_str) => redhook::real!($name)($($before_arg, )* c_str.as_ptr() $(, $after_arg)*),
+            Err(e) => {
+                log!("{}: {}", HOOK_TAG, e);
+                redhook::real!($name)($($before_arg, )* $path $(, $after_arg)*)
+            },
+        }
+    }};
+}
+
 // hooks -----------------------------------------------------------------------
 
 // open
 redhook::hook! {
     unsafe fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int => my_open {
-        let fake = get_fake_path(CStr::from_ptr(path));
-        match fake {
-            Ok(c_str) => redhook::real!(open)(c_str.as_ptr(), flags, mode),
-            Err(e) => {
-                log!("{}: {}", HOOK_TAG, e);
-                redhook::real!(open)(path, flags, mode)
-            },
-        }
+        do_hook!(open => [path], flags, mode)
     }
 }
 
 // open64
 redhook::hook! {
     unsafe fn open64(path: *const c_char, flags: c_int, mode: c_int) -> c_int => my_open64 {
-        let fake = get_fake_path(CStr::from_ptr(path));
-        match fake {
-            Ok(c_str) => redhook::real!(open64)(c_str.as_ptr(), flags, mode),
-            Err(e) => {
-                log!("{}: {}", HOOK_TAG, e);
-                redhook::real!(open64)(path, flags, mode)
-            },
-        }
+        do_hook!(open64 => [path], flags, mode)
     }
 }
 
+// fopen
+redhook::hook! {
+    unsafe fn fopen(path: *const c_char, mode: *const c_char) -> *mut FILE => my_fopen {
+        do_hook!(fopen => [path], mode)
+    }
+}
+
+// opendir
 redhook::hook! {
     unsafe fn opendir(path: *const c_char) -> *mut DIR => my_opendir {
-        if env::var(ENV_FAKE_DIRS).is_err() {
-            return redhook::real!(opendir)(path);
-        }
-
-        let fake = get_fake_path(CStr::from_ptr(path));
-        match fake {
-            Ok(c_str) => redhook::real!(opendir)(c_str.as_ptr()),
-            Err(e) => {
-                log!("{}: {}", HOOK_TAG, e);
-                redhook::real!(opendir)(path)
-            }
+        match env::var(ENV_FAKE_DIRS) {
+            Ok(_) => do_hook!(opendir => [path]),
+            Err(_) => redhook::real!(opendir)(path)
         }
     }
 }
@@ -155,7 +156,7 @@ redhook::hook! {
 mod tests {
     use std::{
         env, fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{self, Command},
     };
 
@@ -173,12 +174,22 @@ mod tests {
             .join("libfakeroot.so")
     }
 
+    fn ls(dir: &Path) -> Vec<String> {
+        let mut list = fs::read_dir(dir)
+            .unwrap()
+            .map(|ent| ent.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        list.sort();
+        list
+    }
+
     macro_rules! cmd {
         (
             $fake_root:expr,
             $cmd:expr
             $(, dirs = $dirs:literal)?
             $(, debug = $debug:literal)?
+            $(,)?
         ) => {{
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
@@ -190,13 +201,28 @@ mod tests {
                     cmd.env(ENV_FAKE_DIRS, "1");
                 }
             )?
+
             $(
                 if $debug {
                     cmd.env("DEBUG", "1");
                 }
             )?
-            cmd.output()
-                .unwrap()
+
+            let output = cmd.output()
+                .unwrap();
+
+            let success = output.status.success();
+            if !success {
+                assert!(
+                    false,
+                    "\"{}\" -> {}\n{}",
+                    $cmd,
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            output
         }};
     }
 
@@ -216,7 +242,7 @@ mod tests {
         };
     }
 
-    test!(simple, |dir: &PathBuf| {
+    test!(simple, |dir: &Path| {
         let fake_etc = dir.join("etc");
         fs::create_dir_all(&fake_etc).unwrap();
         fs::write(fake_etc.join("hosts"), "🎉").unwrap();
@@ -230,7 +256,7 @@ mod tests {
         assert_eq!(output.stdout, fs::read("/etc/passwd").unwrap());
     });
 
-    test!(debug, |dir: &PathBuf| {
+    test!(debug, |dir: &Path| {
         let fake_etc = dir.join("etc");
         fs::create_dir_all(&fake_etc).unwrap();
         fs::write(fake_etc.join("hosts"), "🎉").unwrap();
@@ -263,5 +289,22 @@ mod tests {
         // check dir hooked
         let output = cmd!(&dir, "ls /etc", dirs = true);
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "FAKED");
+    });
+
+    // tests fopen by using `tee`
+    // https://github.com/coreutils/coreutils/blob/master/src/tee.c#L263
+    test!(fopen, |dir: &Path| {
+        let fake_opt = dir.join("opt");
+        fs::create_dir_all(&fake_opt).unwrap();
+        fs::write(fake_opt.join("foo"), "").unwrap();
+        fs::write(fake_opt.join("bar"), "").unwrap();
+
+        cmd!(
+            &dir,
+            "echo 1 | tee /opt/{foo,bar}",
+            dirs = true,
+            debug = true
+        );
+        assert_eq!(ls(&fake_opt), ["bar", "foo"]);
     });
 }
