@@ -176,15 +176,6 @@ mod tests {
             .join("libfakeroot.so")
     }
 
-    fn ls(dir: &Path) -> Vec<String> {
-        let mut list = fs::read_dir(dir)
-            .unwrap()
-            .map(|ent| ent.unwrap().file_name().to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        list.sort();
-        list
-    }
-
     macro_rules! cmd {
         (
             $fake_root:expr,
@@ -298,15 +289,16 @@ mod tests {
     test!(fopen, |dir: &Path| {
         let fake_opt = dir.join("opt");
         fs::create_dir_all(&fake_opt).unwrap();
-        fs::write(fake_opt.join("foo"), "").unwrap();
-        fs::write(fake_opt.join("bar"), "").unwrap();
+        fs::write(fake_opt.join("foo"), "not 1").unwrap();
+        fs::write(fake_opt.join("bar"), "not 1").unwrap();
 
         cmd!(
             &dir,
-            "echo 1 | tee /opt/{foo,bar}",
+            "echo -n 1 | tee /opt/{foo,bar}",
             dirs = true,
             debug = true
         );
-        assert_eq!(ls(&fake_opt), ["bar", "foo"]);
+        assert_eq!(fs::read_to_string(fake_opt.join("foo")).unwrap(), "1");
+        assert_eq!(fs::read_to_string(fake_opt.join("bar")).unwrap(), "1");
     });
 }
