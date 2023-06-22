@@ -107,13 +107,18 @@ fn get_fake_path(c_str: &CStr) -> Result<CString, Box<dyn Error>> {
 // macros ----------------------------------------------------------------------
 
 macro_rules! do_hook {
-    ($name:ident => $($before_arg:ident, )* [$path:ident] $(, $after_arg:ident)* $(,)?) => {{
-        let fake = get_fake_path(CStr::from_ptr($path));
-        match fake {
-            Ok(c_str) => redhook::real!($name)($($before_arg, )* c_str.as_ptr() $(, $after_arg)*),
+    ($name:ident => $($before_arg:ident, )* [$path:ident] $(, $after_arg:ident)* $(,)?) => {
+        do_hook!($name if true => $($before_arg, )* [$path] $(, $after_arg)*)
+    };
+
+    ($name:ident if $cond:expr => $($before_arg:ident, )* [$path:ident] $(, $after_arg:ident)* $(,)?) => {{
+        let real = redhook::real!($name);
+        match get_fake_path(CStr::from_ptr($path)) {
+            Ok(c_str) if $cond => real($($before_arg, )* c_str.as_ptr() $(, $after_arg)*),
+            Ok(_) => real($($before_arg, )* $path $(, $after_arg)*),
             Err(e) => {
                 log!("{}: {}", HOOK_TAG, e);
-                redhook::real!($name)($($before_arg, )* $path $(, $after_arg)*)
+                real($($before_arg, )* $path $(, $after_arg)*)
             },
         }
     }};
@@ -145,10 +150,7 @@ redhook::hook! {
 // opendir
 redhook::hook! {
     unsafe fn opendir(path: *const c_char) -> *mut DIR => my_opendir {
-        match env::var(ENV_FAKE_DIRS) {
-            Ok(_) => do_hook!(opendir => [path]),
-            Err(_) => redhook::real!(opendir)(path)
-        }
+        do_hook!(opendir if env::var(ENV_FAKE_DIRS).is_ok() => [path])
     }
 }
 
