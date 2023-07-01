@@ -12,7 +12,7 @@ Some examples follow.
 ```bash
 mkdir /tmp/etc
 echo "tee hee" > /tmp/etc/hosts
-FAKE_ROOT="/tmp" LD_PRELOAD="path/to/libfakeroot.so" cat /etc/hosts
+FAKEROOT="/tmp" LD_PRELOAD="path/to/libfakeroot.so" cat /etc/hosts
 # tee hee
 ```
 
@@ -20,7 +20,7 @@ FAKE_ROOT="/tmp" LD_PRELOAD="path/to/libfakeroot.so" cat /etc/hosts
 ```bash
 mkdir /tmp/etc
 echo "whatever" > /tmp/etc/🪃
-FAKE_ROOT="/tmp" FAKE_DIRS=1 LD_PRELOAD="path/to/libfakeroot.so" ls /etc
+FAKEROOT="/tmp" FAKEROOT_DIRS=1 LD_PRELOAD="path/to/libfakeroot.so" ls /etc
 # 🪃
 ```
 
