@@ -20,9 +20,10 @@
 //! ```
 //!
 //! Options are configured via environment variables:
-//! * `FAKE_ROOT`: absolute path to the fake root
-//! * `FAKE_DIRS`: whether or not to intercept directory listing calls too
-//! * `DEBUG`: if set, will debug log to STDERR
+//! * `FAKEROOT`: absolute path to the fake root
+//! * `FAKEROOT_DIRS`: whether or not to intercept directory listing calls too
+//! * `FAKEROOT_ALL`: whether or not to fake non-existent files and directories
+//! * `FAKEROOT_DEBUG`: if set, will debug log to STDERR
 
 use std::cell::OnceCell;
 use std::error::Error;
@@ -35,39 +36,43 @@ use libc::{c_char, c_int};
 use libc::{DIR, FILE};
 
 /// Required: absolute path to the directory to use as the fake root
-pub const ENV_FAKE_ROOT: &str = "FAKE_ROOT";
+pub const ENV_FAKEROOT: &str = "FAKEROOT";
 /// Optional: should this also hook directories?
-pub const ENV_FAKE_DIRS: &str = "FAKE_DIRS";
+pub const ENV_FAKEROOT_DIRS: &str = "FAKEROOT_DIRS";
+/// Optional: should non existent files be faked?
+pub const ENV_FAKEROOT_ALL: &str = "FAKEROOT_ALL";
 /// Optional: should this hook log debug information to STDERR?
-pub const ENV_DEBUG: &str = "DEBUG";
+pub const ENV_FAKEROOT_DEBUG: &str = "FAKEROOT_DEBUG";
 
 /// Used as a prefix for all debug logs
 const HOOK_TAG: &str = "@HOOK@";
 /// Runtime cache of the fake root directory
-const FAKE_ROOT: OnceCell<Result<PathBuf, Box<dyn Error>>> = OnceCell::new();
+const FAKEROOT_ROOT: OnceCell<Result<PathBuf, Box<dyn Error>>> = OnceCell::new();
+/// Runtime cache of debug state
+const FAKEROOT_DEBUG: OnceCell<bool> = OnceCell::new();
 
 macro_rules! log {
     ($($arg:tt)+) => {
-        if std::env::var(ENV_DEBUG).is_ok() {
+        if *FAKEROOT_DEBUG.get_or_init(|| is_enabled(ENV_FAKEROOT_DEBUG)) {
             eprintln!($($arg)*);
         }
     };
 }
 
 /// Read the environment variable to know where the fake root directory is.
-/// This is used to initialise the `FAKE_ROOT` `OnceCell` constant.
+/// This is used to initialise the `FAKEROOT_ROOT` `OnceCell` constant.
 fn get_fake_root() -> Result<PathBuf, Box<dyn Error>> {
-    match env::var(ENV_FAKE_ROOT) {
+    match env::var(ENV_FAKEROOT) {
         Ok(path) => {
             let path = PathBuf::from(path);
             if path.is_absolute() {
                 if path.exists() {
                     Ok(path)
                 } else {
-                    Err(format!("{} does not exist on disk", ENV_FAKE_ROOT).into())
+                    Err(format!("{} does not exist on disk", ENV_FAKEROOT).into())
                 }
             } else {
-                Err(format!("{} is not absolute", ENV_FAKE_ROOT).into())
+                Err(format!("{} is not absolute", ENV_FAKEROOT).into())
             }
         }
         Err(e) => Err(e.into()),
@@ -85,7 +90,7 @@ fn get_fake_path(c_str: &CStr) -> Result<CString, Box<dyn Error>> {
     };
 
     // get fake root
-    let fake_root = match FAKE_ROOT.get_or_init(get_fake_root) {
+    let fake_root = match FAKEROOT_ROOT.get_or_init(get_fake_root) {
         Ok(path) => path.to_path_buf(),
         Err(e) => {
             return Err(format!("{}", e).into());
@@ -95,13 +100,22 @@ fn get_fake_path(c_str: &CStr) -> Result<CString, Box<dyn Error>> {
     // make path relative to our fake root
     // trim off leading `/` since `.join` will replace if it finds an absolute path
     let fake_path = fake_root.join(&path_str[1..]);
-    if !fake_path.exists() {
+
+    // bail out if the file doesn't exist and `ENV_FAKEROOT_ALL` isn't enabled
+    if !is_enabled(ENV_FAKEROOT_ALL) && !fake_path.exists() {
         return Err(format!("not in fake root: {}", path_str).into());
     }
 
     // we found a fake file, return a string representing its path
     log!("{}: {} => {}", HOOK_TAG, path_str, fake_path.display());
     Ok(CString::new(fake_path.as_os_str().as_bytes()).unwrap())
+}
+
+fn is_enabled(env_key: &str) -> bool {
+    match env::var(env_key) {
+        Ok(val) => val != "false" && val != "0",
+        Err(_) => false,
+    }
 }
 
 // macros ----------------------------------------------------------------------
@@ -150,9 +164,11 @@ redhook::hook! {
 // opendir
 redhook::hook! {
     unsafe fn opendir(path: *const c_char) -> *mut DIR => my_opendir {
-        do_hook!(opendir if env::var(ENV_FAKE_DIRS).is_ok() => [path])
+        do_hook!(opendir if is_enabled(ENV_FAKEROOT_DIRS) => [path])
     }
 }
+
+// tests -----------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -163,6 +179,29 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_is_enabled() {
+        let test_var = "test_var";
+
+        env::remove_var(test_var);
+        assert_eq!(is_enabled(test_var), false);
+
+        env::set_var(test_var, "false");
+        assert_eq!(is_enabled(test_var), false);
+
+        env::set_var(test_var, "0");
+        assert_eq!(is_enabled(test_var), false);
+
+        env::set_var(test_var, "true");
+        assert_eq!(is_enabled(test_var), true);
+
+        env::set_var(test_var, "1");
+        assert_eq!(is_enabled(test_var), true);
+
+        env::set_var(test_var, "anything");
+        assert_eq!(is_enabled(test_var), true);
+    }
 
     // NOTE: this requires that `cargo build` be run before the tests are run
     // - is there a way to use one that's built when the tests are built?
@@ -176,10 +215,17 @@ mod tests {
             .join("libfakeroot.so")
     }
 
+    macro_rules! cat {
+        ($p:expr) => {
+            fs::read_to_string($p).unwrap()
+        };
+    }
+
     macro_rules! cmd {
         (
             $fake_root:expr,
             $cmd:expr
+            $(, all = $all:literal)?
             $(, dirs = $dirs:literal)?
             $(, debug = $debug:literal)?
             $(,)?
@@ -188,16 +234,23 @@ mod tests {
             cmd.arg("-c")
                 .arg($cmd)
                 .env("LD_PRELOAD", get_so().display().to_string())
-                .env(ENV_FAKE_ROOT, $fake_root);
+                .env(ENV_FAKEROOT, $fake_root);
+
+            $(
+                if $all {
+                    cmd.env(ENV_FAKEROOT_ALL, "1");
+                }
+            )?
+
             $(
                 if $dirs {
-                    cmd.env(ENV_FAKE_DIRS, "1");
+                    cmd.env(ENV_FAKEROOT_DIRS, "1");
                 }
             )?
 
             $(
                 if $debug {
-                    cmd.env("DEBUG", "1");
+                    cmd.env(ENV_FAKEROOT_DEBUG, "1");
                 }
             )?
 
@@ -219,9 +272,11 @@ mod tests {
         }};
     }
 
+    // TODO: include doc comments so can add #[should_panic] on top
     macro_rules! test {
-        ($name:ident, $f:expr) => {
+        ($(#[$($attr:tt)+] )? $name:ident, $f:expr) => {
             #[test]
+            $(#[$($attr)+])?
             fn $name() {
                 let tmp_dir = env::temp_dir().join(format!(
                     "fakehook-{}-{}",
@@ -256,7 +311,7 @@ mod tests {
 
         // this checks ENV_DEBUG behaviour, so ensure it's not set
         assert!(
-            env::var(ENV_DEBUG).is_err(),
+            env::var(ENV_FAKEROOT_DEBUG).is_err(),
             "DEBUG must not be defined during tests"
         );
 
@@ -294,11 +349,24 @@ mod tests {
 
         cmd!(
             &dir,
-            "echo -n 1 | tee /opt/{foo,bar}",
+            "echo 1 | tee /opt/{foo,bar}",
             dirs = true,
             debug = true
         );
-        assert_eq!(fs::read_to_string(fake_opt.join("foo")).unwrap(), "1");
-        assert_eq!(fs::read_to_string(fake_opt.join("bar")).unwrap(), "1");
+        assert_eq!(cat!(fake_opt.join("foo")).trim(), "1");
+        assert_eq!(cat!(fake_opt.join("bar")).trim(), "1");
     });
+
+    test!(all, |fake_dir: &Path| {
+        cmd!(&fake_dir, "echo 1 > /asdf", all = true);
+        assert_eq!(cat!(fake_dir.join("asdf")).trim(), "1");
+    });
+
+    test!(
+        #[should_panic(expected = "/asdf: Permission denied")]
+        all_unset,
+        |fake_dir: &Path| {
+            cmd!(&fake_dir, "echo 1 > /asdf");
+        }
+    );
 }

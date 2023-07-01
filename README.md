@@ -1,3 +1,6 @@
+[![crate](https://img.shields.io/crates/v/fakeroot)](https://crates.io/crates/fakeroot)
+[![documentation](https://docs.rs/fakeroot/badge.svg)](https://docs.rs/fakeroot)
+
 # fakeroot
 
 A simple crate which provides the ability to redirect filesystem calls.
@@ -22,8 +25,9 @@ FAKE_ROOT="/tmp" FAKE_DIRS=1 LD_PRELOAD="path/to/libfakeroot.so" ls /etc
 ```
 
 Options are configured via environment variables:
-* `FAKE_ROOT`: absolute path to the fake root
-* `FAKE_DIRS`: whether or not to intercept directory listing calls too
-* `DEBUG`: if set, will debug log to STDERR
+* `FAKEROOT`: absolute path to the fake root
+* `FAKEROOT_DIRS`: whether or not to intercept directory listing calls too
+* `FAKEROOT_ALL`: whether or not to fake non-existent files and directories
+* `FAKEROOT_DEBUG`: if set, will debug log to STDERR
 
 License: GPL-3.0-only
